@@ -76,7 +76,7 @@ class ModernButton(tk.Canvas):
 class SFTPUploaderApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("SFTP Pro (V39 Split Auth)")
+        self.root.title("SFTP Pro (V41 Perfect Progress)")
         self.center_window(720, 1200)
         self.root.configure(bg=COLORS["bg"])
 
@@ -104,6 +104,7 @@ class SFTPUploaderApp:
         self.jump_inputs = {}
         self.target_inputs = {}
         self.completed_size = 0  
+        self.total_task_size = 0 
         self.history_records = []
         
         self.start_time = 0
@@ -175,7 +176,6 @@ class SFTPUploaderApp:
         self._add_input_row(target_group, 1, "用户名:", "target_user", "")
         self._add_input_row(target_group, 2, "密钥Key (选填):", "target_key", os.path.expanduser("~/.ssh/id_rsa"), is_file=True)
         
-        # [NEW] 拆分 静态密码 和 PortalPIN
         self._add_input_row(target_group, 3, "密码:", "target_static_pwd", "", is_password=True)
         self._add_input_row(target_group, 4, "PortalPIN (集群):", "target_pass", "", is_password=True)
         
@@ -210,7 +210,7 @@ class SFTPUploaderApp:
         ctrl_frame = tk.Frame(main_frame, bg=COLORS["bg"])
         ctrl_frame.pack(fill="x", pady=5)
         
-        self.progress_bar = ttk.Progressbar(ctrl_frame, style="Terminal.Horizontal.TProgressbar", mode="indeterminate")
+        self.progress_bar = ttk.Progressbar(ctrl_frame, style="Terminal.Horizontal.TProgressbar", mode="determinate")
         self.progress_bar.pack(fill="x", pady=(0, 5))
         
         # [连接状态灯 & 强制覆盖开关]
@@ -631,10 +631,10 @@ class SFTPUploaderApp:
         self.btn_start.set_state("disabled")
         self.btn_stop.set_state("normal")
         
-        self.progress_bar.config(mode="indeterminate")
-        self.progress_bar.start(10)
+        self.progress_bar.config(value=0)
         
         self.completed_size = 0
+        self.total_task_size = 0
         self.start_time = time.time()
         self.last_update_time = self.start_time
         self.last_size = 0
@@ -648,12 +648,56 @@ class SFTPUploaderApp:
             self.log("Aborting task...", "WARN")
             self.btn_stop.set_state("disabled")
 
+    def _get_recursive_local_size(self, path):
+        total = 0
+        try:
+            if os.path.isfile(path): return os.path.getsize(path)
+            for root, dirs, files in os.walk(path):
+                if not self.is_running: break
+                for f in files:
+                    try: total += os.path.getsize(os.path.join(root, f))
+                    except: pass
+        except: pass
+        return total
+
+    def _get_recursive_remote_size(self, sftp, path):
+        total = 0
+        try:
+            try:
+                attr = sftp.stat(path)
+                if not stat.S_ISDIR(attr.st_mode):
+                    return attr.st_size
+            except: return 0
+
+            for entry in sftp.listdir_attr(path):
+                if not self.is_running: break
+                r_path = posixpath.join(path, entry.filename)
+                if stat.S_ISDIR(entry.st_mode):
+                    total += self._get_recursive_remote_size(sftp, r_path)
+                else:
+                    total += entry.st_size
+        except: pass
+        return total
+
     def run_process(self):
         try:
             try:
                 self.sftp_client.listdir('.')
             except:
                 raise Exception("连接已断开，请重新点击 [连接服务器]")
+
+            self.log("正在计算任务总大小... (Computing total size)", "INFO")
+            
+            if self.current_action == "upload":
+                self.total_task_size = self._get_recursive_local_size(self.up_local_path.get())
+            else:
+                self.log("提示：远程文件夹大小计算较慢，请稍候...", "WARN")
+                self.total_task_size = self._get_recursive_remote_size(self.sftp_client, self.down_remote_path.get())
+            
+            if self.total_task_size == 0: self.total_task_size = 100
+            
+            self.root.after(0, lambda: self.progress_bar.configure(maximum=self.total_task_size))
+            self.log(f"Total Size: {self.total_task_size / 1048576:.2f} MB", "INFO")
 
             if self.current_action == "upload": 
                 self.do_upload(self.sftp_client)
@@ -662,6 +706,18 @@ class SFTPUploaderApp:
                 
             if self.is_running: 
                 self.log("TASK COMPLETE.", "SUCCESS")
+                
+                # --- [MODIFIED] 强制设置 UI 为 100% ---
+                def set_complete_ui():
+                    # 1. 进度条拉满
+                    self.progress_bar["value"] = self.total_task_size
+                    # 2. 文字强制变 100.0%
+                    mb = self.total_task_size / 1048576
+                    self.progress_label.config(text=f"进度: 100.0% | 已传: {mb:.1f} MB | 状态: 完成")
+                
+                self.root.after(0, set_complete_ui)
+                # -------------------------------------
+                
                 messagebox.showinfo("Done", "传输完成")
             else: 
                 self.log("Task Aborted.", "WARN")
@@ -672,12 +728,15 @@ class SFTPUploaderApp:
             messagebox.showerror("Error", str(e))
         finally:
             self.is_running = False
-            self.root.after(0, self.progress_bar.stop) 
             self.btn_start.set_state("normal")
             self.btn_stop.set_state("disabled")
 
     def update_status(self, current_file_name, chunk_size=0):
+        if not self.is_running: return # 如果已经停止，不再更新
+        
         self.completed_size += chunk_size
+        self.progress_bar["value"] = self.completed_size
+        
         now = time.time()
         if now - self.last_update_time > 0.5:
             duration = now - self.last_update_time
@@ -687,7 +746,11 @@ class SFTPUploaderApp:
             mb_transferred = self.completed_size / 1048576
             speed_mb = speed / 1048576
             
-            status_text = f"已传: {mb_transferred:.1f} MB | 速度: {speed_mb:.1f} MB/s | 文件: {current_file_name[-30:]}"
+            percent = 0
+            if self.total_task_size > 0:
+                percent = (self.completed_size / self.total_task_size) * 100
+            
+            status_text = f"进度: {percent:.1f}% | 已传: {mb_transferred:.1f} MB | 速度: {speed_mb:.1f} MB/s | 文件: {current_file_name[-20:]}"
             self.progress_label.config(text=status_text)
             self.last_update_time = now
             self.last_size = self.completed_size
