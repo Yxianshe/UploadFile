@@ -1,0 +1,3 @@
+conda activate small-app
+cd E:\PythonApps\UploadFile\UploadFile_V3.8
+pyinstaller exe.spec
